@@ -4,7 +4,8 @@
  */
 
 import { SUPERADMIN_SPECIAL_ID, normalizeRole, canSwitchStores } from './permissions.js';
-import { db, supabase } from './database.js';
+import { db } from './database.js';
+import { supabase } from './supabase.js';
 
 const AUTH_STORAGE_KEY = 'gef_authenticated_user_v2';
 
