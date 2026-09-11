@@ -4,7 +4,7 @@
  */
 
 import { SUPERADMIN_SPECIAL_ID, normalizeRole, canSwitchStores } from './permissions.js';
-import { db } from './database.js';
+import { db, supabase } from './database.js';
 
 const AUTH_STORAGE_KEY = 'gef_authenticated_user_v2';
 
@@ -75,14 +75,19 @@ class AuthService {
   init() {
     try {
       const saved = localStorage.getItem(AUTH_STORAGE_KEY);
+
       if (saved) {
         const parsed = JSON.parse(saved);
+
         if (parsed && parsed.id) {
           const role = normalizeRole(parsed.role, parsed.id);
+
           this.currentUser = {
             ...parsed,
             role,
-            storeId: role === 'SUPERADMIN' ? 'ALL' : (parsed.storeId || 'store-001')
+            storeId: role === 'SUPERADMIN'
+              ? 'ALL'
+              : (parsed.storeId || 'store-001')
           };
         }
       }
@@ -109,83 +114,291 @@ class AuthService {
     return !!this.currentUser && this.currentUser.active !== false;
   }
 
+  /**
+   * LOGIN REAL ATRAVÉS DO SUPABASE AUTH
+   */
   async signIn(email, password) {
     const cleanEmail = (email || '').trim().toLowerCase();
-    const demo = DEMO_USERS.find(u => u.email.toLowerCase() === cleanEmail);
-    if (demo) {
-      this.currentUser = { ...demo };
-      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(this.currentUser));
-      this.notify();
-      return { success: true, user: this.currentUser };
+
+    if (!cleanEmail || !password) {
+      return {
+        success: false,
+        error: 'Informe o e-mail e a password.'
+      };
     }
 
-    // Default operator if not found in demo list
-    const role = cleanEmail.includes('admin') ? 'ADMIN' : 'CASHIER';
-    this.currentUser = {
-      id: 'user-' + Date.now(),
-      email: cleanEmail,
-      fullName: cleanEmail.split('@')[0].toUpperCase(),
-      role,
-      storeId: 'store-001',
-      storeName: 'Loja Principal',
-      active: true
-    };
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(this.currentUser));
-    this.notify();
-    return { success: true, user: this.currentUser };
+    try {
+      const { data: authData, error: authError } =
+        await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password
+        });
+
+      if (authError) {
+        return {
+          success: false,
+          error: authError.message
+        };
+      }
+
+      if (!authData || !authData.user) {
+        return {
+          success: false,
+          error: 'Utilizador não encontrado.'
+        };
+      }
+
+      const authUser = authData.user;
+
+      /**
+       * BUSCAR PERFIL DO GEF
+       */
+      const { data: profile, error: profileError } =
+        await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', authUser.id)
+          .single();
+
+      if (profileError || !profile) {
+        await supabase.auth.signOut();
+
+        return {
+          success: false,
+          error: 'Perfil do utilizador não encontrado no GEF.'
+        };
+      }
+
+      /**
+       * VERIFICAR ESTADO DA CONTA
+       */
+      if (profile.active === false) {
+        await supabase.auth.signOut();
+
+        return {
+          success: false,
+          error: 'A sua conta está bloqueada ou desativada.'
+        };
+      }
+
+      /**
+       * NORMALIZAR ROLE
+       *
+       * O permissions.js transforma:
+       * OPERADOR_CAIXA / CAIXA / CASHIER
+       * em CASHIER.
+       */
+      const role = normalizeRole(profile.role, authUser.id);
+
+      /**
+       * IDENTIFICAR LOJA
+       */
+      let storeId = profile.store_id || null;
+      let storeName = 'Sem loja atribuída';
+
+      /**
+       * SUPERADMIN TEM ACESSO GLOBAL
+       */
+      if (role === 'SUPERADMIN') {
+        storeId = 'ALL';
+        storeName = 'Plataforma Global (Monitor & SaaS)';
+      }
+
+      /**
+       * BUSCAR NOME DA LOJA
+       */
+      if (storeId && storeId !== 'ALL') {
+        const { data: store } =
+          await supabase
+            .from('stores')
+            .select('id, name, trade_name')
+            .eq('id', storeId)
+            .maybeSingle();
+
+        if (store) {
+          storeName = store.trade_name || store.name;
+        }
+      }
+
+      /**
+       * CRIAR UTILIZADOR DA SESSÃO
+       */
+      this.currentUser = {
+        id: authUser.id,
+        email: profile.email || authUser.email || cleanEmail,
+        fullName:
+          profile.full_name ||
+          authUser.user_metadata?.full_name ||
+          cleanEmail.split('@')[0],
+        role,
+        storeId,
+        storeName,
+        active: profile.active !== false
+      };
+
+      localStorage.setItem(
+        AUTH_STORAGE_KEY,
+        JSON.stringify(this.currentUser)
+      );
+
+      this.notify();
+
+      return {
+        success: true,
+        user: this.currentUser
+      };
+
+    } catch (error) {
+      console.error('Erro no login:', error);
+
+      return {
+        success: false,
+        error: error?.message || 'Erro ao iniciar sessão.'
+      };
+    }
   }
 
-  async signUp(email, password, fullName, role = 'CASHIER', storeId = 'store-001') {
+  /**
+   * CADASTRO
+   */
+  async signUp(
+    email,
+    password,
+    fullName,
+    role = 'CASHIER',
+    storeId = 'store-001'
+  ) {
     const normalizedRole = normalizeRole(role);
-    this.currentUser = {
-      id: 'user-' + Date.now(),
-      email: email.trim(),
-      fullName: fullName.trim(),
-      role: normalizedRole,
-      storeId: normalizedRole === 'SUPERADMIN' ? 'ALL' : storeId,
-      storeName: 'Loja Principal',
-      active: true
-    };
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(this.currentUser));
-    this.notify();
-    return { success: true, user: this.currentUser };
+
+    try {
+      const { data, error } =
+        await supabase.auth.signUp({
+          email: email.trim().toLowerCase(),
+          password,
+          options: {
+            data: {
+              full_name: fullName.trim()
+            }
+          }
+        });
+
+      if (error) {
+        return {
+          success: false,
+          error: error.message
+        };
+      }
+
+      if (!data || !data.user) {
+        return {
+          success: false,
+          error: 'Não foi possível criar o utilizador.'
+        };
+      }
+
+      this.currentUser = {
+        id: data.user.id,
+        email: email.trim().toLowerCase(),
+        fullName: fullName.trim(),
+        role: normalizedRole,
+        storeId: normalizedRole === 'SUPERADMIN'
+          ? 'ALL'
+          : storeId,
+        storeName: 'Loja Principal',
+        active: true
+      };
+
+      localStorage.setItem(
+        AUTH_STORAGE_KEY,
+        JSON.stringify(this.currentUser)
+      );
+
+      this.notify();
+
+      return {
+        success: true,
+        user: this.currentUser
+      };
+
+    } catch (error) {
+      console.error('Erro no cadastro:', error);
+
+      return {
+        success: false,
+        error: error?.message || 'Não foi possível criar o utilizador.'
+      };
+    }
   }
 
   selectDemoUser(demoUser) {
     const role = normalizeRole(demoUser.role, demoUser.id);
+
     this.currentUser = {
       ...demoUser,
       role,
-      storeId: role === 'SUPERADMIN' ? 'ALL' : demoUser.storeId
+      storeId: role === 'SUPERADMIN'
+        ? 'ALL'
+        : demoUser.storeId
     };
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(this.currentUser));
+
+    localStorage.setItem(
+      AUTH_STORAGE_KEY,
+      JSON.stringify(this.currentUser)
+    );
+
     this.notify();
   }
 
   switchActiveStore(storeId) {
     if (!this.currentUser) return;
+
     if (!canSwitchStores(this.currentUser)) {
       console.warn('Troca de loja não autorizada para esta função.');
       return;
     }
+
     const stores = db.getStores();
-    const assignedStore = stores.find(s => s.id === storeId);
+
+    const assignedStore = stores.find(
+      s => s.id === storeId
+    );
+
     const storeName = storeId === 'ALL'
       ? 'Todas as Filiais (Consolidado)'
-      : (assignedStore?.tradeName || assignedStore?.name || 'Loja Ativa');
+      : (
+          assignedStore?.tradeName ||
+          assignedStore?.name ||
+          'Loja Ativa'
+        );
 
     this.currentUser = {
       ...this.currentUser,
       storeId,
       storeName
     };
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(this.currentUser));
+
+    localStorage.setItem(
+      AUTH_STORAGE_KEY,
+      JSON.stringify(this.currentUser)
+    );
+
     this.notify();
   }
 
-  signOut() {
+  async signOut() {
+    try {
+      await supabase.auth.signOut();
+    } catch (error) {
+      console.warn(
+        'Erro ao terminar sessão no Supabase:',
+        error
+      );
+    }
+
     this.currentUser = null;
+
     localStorage.removeItem(AUTH_STORAGE_KEY);
+
     this.notify();
   }
 }
